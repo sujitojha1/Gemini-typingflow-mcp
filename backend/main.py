@@ -15,9 +15,9 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-_api_key = os.getenv("GOOGLE_API_KEY")
+_api_key = os.getenv("GEMINI_API_KEY")
 if not _api_key:
-    raise RuntimeError("GOOGLE_API_KEY is not set — add it to backend/.env")
+    raise RuntimeError("GEMINI_API_KEY is not set — add it to backend/.env")
 
 client = genai.Client(api_key=_api_key)
 

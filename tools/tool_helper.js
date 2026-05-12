@@ -1,60 +1,37 @@
-// tool_helper.js — Shared LLM call helper for all tool_*.js files.
-// Eliminates ~35 lines of boilerplate duplicated across 5 tool files.
+// tool_helper.js — Forwards individual tool prompts to the backend /api/tool endpoint.
+// The tool_*.js files in this directory are retained as readable documentation of
+// what each tool does; the actual LLM execution happens in backend/main.py.
 //
-// Depends on: background.js globals:
-//   pickAgentModel, fetchWithTimeout, pickResponseText, stripMarkdownFences
+// Depends on: background.js globals — fetchWithTimeout, getBackendUrl
 
 async function callToolModel(prompt, defaultResult, timeoutMs = 20000) {
-    const { geminiApiKey } = await chrome.storage.sync.get('geminiApiKey');
-    if (!geminiApiKey) {
-        console.warn('[tool] callToolModel: no API key configured');
-        return { ...defaultResult, error: 'No API key' };
+    let backendUrl;
+    try {
+        backendUrl = await getBackendUrl();
+    } catch (_) {
+        backendUrl = 'http://localhost:8000';
     }
 
-    // Try every model in the pool before giving up — mirrors the Track 1 structuring loop
-    let lastError = 'no models available';
-    for (const model of AGENT_MODEL_POOL) {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model.id}:generateContent?key=${geminiApiKey}`;
-        try {
-            const res = await fetchWithTimeout(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: { response_mime_type: 'application/json' },
-                }),
-            }, timeoutMs);
+    try {
+        const res = await fetchWithTimeout(`${backendUrl}/api/tool`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+        }, timeoutMs);
 
-            if (!res.ok) {
-                const errBody = await res.json().catch(() => ({}));
-                lastError = `API ${res.status}: ${errBody.error?.message || res.statusText}`;
-                console.warn(`[tool] ${model.label} HTTP ${res.status} — trying next model`);
-                continue;
-            }
-
-            const data = await res.json();
-            const jsonText = pickResponseText(data);
-            if (!jsonText) {
-                lastError = 'Empty response';
-                console.warn(`[tool] ${model.label}: empty response — trying next model`);
-                continue;
-            }
-
-            try {
-                return JSON.parse(stripMarkdownFences(jsonText));
-            } catch (parseErr) {
-                lastError = `Parse failed: ${parseErr.message}`;
-                console.error(`[tool] ${model.label}: JSON parse failed:`, parseErr.message, '| raw:', jsonText.slice(0, 200));
-                continue;
-            }
-        } catch (e) {
-            const isTimeout = e.name === 'AbortError';
-            lastError = isTimeout ? `timed out after ${timeoutMs}ms` : e.message;
-            console.error(`[tool] ${model.label} ${isTimeout ? 'TIMEOUT' : 'threw'}:`, e.message);
-            continue;
+        if (!res.ok) {
+            const errBody = await res.json().catch(() => ({}));
+            const lastError = `Backend ${res.status}: ${errBody.detail || res.statusText}`;
+            console.warn(`[tool] callToolModel HTTP error — ${lastError}`);
+            return { ...defaultResult, error: lastError };
         }
-    }
 
-    console.warn('[tool] callToolModel: all models exhausted —', lastError);
-    return { ...defaultResult, error: lastError };
+        return await res.json();
+    } catch (e) {
+        const lastError = e.name === 'AbortError'
+            ? `timed out after ${timeoutMs}ms`
+            : e.message;
+        console.warn('[tool] callToolModel failed —', lastError);
+        return { ...defaultResult, error: lastError };
+    }
 }

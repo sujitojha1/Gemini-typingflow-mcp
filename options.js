@@ -1,4 +1,4 @@
-// shared_config.js is loaded before this script via <script> in options.html
+const BACKEND_URL = 'http://localhost:8000';
 
 const backendUrlInput = document.getElementById('backendUrl');
 const testBtn         = document.getElementById('testBtn');

@@ -21,7 +21,7 @@ if not _api_key:
 
 client = genai.Client(api_key=_api_key)
 
-STRUCTURE_MODEL = os.getenv("STRUCTURE_MODEL", "gemini-2.5-flash")
+STRUCTURE_MODEL = os.getenv("STRUCTURE_MODEL", "gemini-3.1-flash-lite")
 TOOL_MODEL      = os.getenv("TOOL_MODEL",      "gemini-2.5-flash-lite")
 IMAGE_MODEL     = os.getenv("IMAGE_MODEL",     "gemini-2.0-flash-preview-image-generation")
 

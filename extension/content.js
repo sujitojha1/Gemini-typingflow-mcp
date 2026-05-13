@@ -63,6 +63,7 @@ let overlayWrapper = null;
 let startTime = null;
 let errorsMade = 0;
 let audioCtx = null;
+let nuggetStats = [];
 
 function getAudioCtx() {
     if (!audioCtx) audioCtx = new AudioContext();
@@ -440,9 +441,14 @@ function mountUI(data) {
     s.textContent = INJECT_CSS;
     document.head.appendChild(s);
     sessionData = data;
+    nuggetStats = [];
 }
 
 function renderNuggetGallery() {
+    if (sessionData._pendingRefined) {
+        applyRefinedNuggets(sessionData._pendingRefined);
+        showAgentToast();
+    }
     const logBtnHtml = sessionData.processHistory ? `<button class="tf-log-btn" id="tf-log-btn">view agent logs</button>` : '';
 
     overlayWrapper.innerHTML = `
@@ -1016,6 +1022,8 @@ function renderCurrentNugget() {
     const statChars = document.getElementById('tf-stat-chars');
     const bottomBar = document.getElementById('tf-bottom-bar');
     let prevTypedLen = 0;
+    let lastWpm = 0;
+    let lastAcc = 100;
 
     // Page nav buttons — only wired when nugget has >900 chars
     if (isMultiPage) {
@@ -1101,6 +1109,8 @@ function renderCurrentNugget() {
         const wpm = timeElapsedMin > 0 ? Math.round((totalTyped / 5) / timeElapsedMin) : 0;
         const acc = typed.length > 0 ? Math.round(((typed.length - localErrors) / typed.length) * 100) : 100;
 
+        lastWpm = wpm;
+        lastAcc = acc;
         statWpm.textContent = wpm;
         statAcc.textContent = `${acc}%`;
         statChars.textContent = `${totalTyped} / ${totalChars}`;
@@ -1116,7 +1126,12 @@ function renderCurrentNugget() {
                 if (isMultiPage) updatePageLabel();
                 input.focus();
             } else {
-                // All pages of this nugget complete
+                // All pages of this nugget complete — capture stats before advancing
+                nuggetStats[capturedIndex] = {
+                    wpm: lastWpm,
+                    accuracy: lastAcc,
+                    timeMs: startTime ? Date.now() - startTime : 0,
+                };
                 currentNuggetIndex++;
                 setTimeout(() => renderCurrentNugget(), 300);
             }
@@ -1153,12 +1168,20 @@ function exportToMarkdown() {
     const d = new Date().toISOString().split('T')[0];
     const rawTags = sessionData.tags || [];
     const tagsYaml = rawTags.map(t => t.replace('#','')).join(', ');
-    
+
+    const completedStats = nuggetStats.filter(Boolean);
+    const avgWpm = completedStats.length
+        ? Math.round(completedStats.reduce((s, n) => s + n.wpm, 0) / completedStats.length)
+        : null;
+    const avgAcc = completedStats.length
+        ? Math.round(completedStats.reduce((s, n) => s + n.accuracy, 0) / completedStats.length)
+        : null;
+
     let md = `---
 title: "Insights: ${document.title.replace(/"/g, "'")}"
 date: ${d}
 tags: [${tagsYaml}]
-source: ${window.location.href}
+source: ${window.location.href}${avgWpm != null ? `\nwpm: ${avgWpm}\naccuracy: ${avgAcc}%\nnuggets_typed: ${completedStats.length}` : ''}
 ---
 
 # ${document.title}
@@ -1169,12 +1192,25 @@ source: ${window.location.href}
 `;
 
     sessionData.nuggets.forEach((n, i) => {
-        md += `\n### Insight ${i+1}\n\n`;
+        md += `\n### Insight ${i+1}`;
+        if (n.subject) md += ` — ${n.subject}`;
+        md += `\n\n`;
         md += `> ${n.text}\n\n`;
         if (n.img_src) {
             md += `![Contextual Asset](${n.img_src})\n\n`;
         }
     });
+
+    if (completedStats.length) {
+        md += `\n## Typing Session Stats\n\n`;
+        md += `| # | WPM | Accuracy | Time |\n|---|---|---|---|\n`;
+        completedStats.forEach((s, i) => {
+            md += `| ${i + 1} | ${s.wpm} | ${s.accuracy}% | ${(s.timeMs / 1000).toFixed(1)}s |\n`;
+        });
+        if (avgWpm != null) {
+            md += `| **avg** | **${avgWpm}** | **${avgAcc}%** | — |\n`;
+        }
+    }
 
     const blob = new Blob([md], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -1208,22 +1244,17 @@ if (!window.geminiTfEventListening) {
             sendResponse({ ok: true });
         } else if (request.action === 'update_nuggets') {
             if (sessionData) {
-                sessionData.geminiNuggets = sessionData.geminiNuggets || sessionData.nuggets;
-                sessionData.nuggets = request.data.nuggets;
-                if (request.data.tldr) sessionData.tldr = request.data.tldr;
-                if (request.data.tags) sessionData.tags = request.data.tags;
-                if (request.data.star_rating) sessionData.star_rating = request.data.star_rating;
-                if (request.data.coverage_pct != null) sessionData.coverage_pct = request.data.coverage_pct;
-                if (request.data.processHistory) sessionData.processHistory = request.data.processHistory;
-                if (request.data.totalMs) sessionData.totalMs = request.data.totalMs;
-                sessionData.isAgentRefined = true;
-
-                // Show toast regardless of which view is active
-                showAgentToast();
-
-                // If gallery is open, re-render cards in place
-                if (overlayWrapper && document.getElementById('tf-ncard-list')) {
-                    renderNuggetGallery();
+                const isTyping = !!document.getElementById('tf-type-input');
+                if (isTyping) {
+                    // Defer: applying mid-typing would replace the active nugget text
+                    sessionData._pendingRefined = request.data;
+                    updateAgentBar('refined (pending)', 'backend', 'Refined nuggets apply when you return to gallery');
+                } else {
+                    applyRefinedNuggets(request.data);
+                    showAgentToast();
+                    if (overlayWrapper && document.getElementById('tf-ncard-list')) {
+                        renderNuggetGallery();
+                    }
                 }
             }
             sendResponse({ success: true });
@@ -1246,6 +1277,19 @@ function updateAgentBar(task, model, detail) {
         if (detail) taskEl.title = detail; // Show full detail on hover
     }
     if (modelEl) modelEl.textContent = model && model !== 'null' ? `· ${model}` : '';
+}
+
+function applyRefinedNuggets(data) {
+    sessionData.geminiNuggets = sessionData.geminiNuggets || sessionData.nuggets;
+    sessionData.nuggets = data.nuggets;
+    if (data.tldr) sessionData.tldr = data.tldr;
+    if (data.tags) sessionData.tags = data.tags;
+    if (data.star_rating) sessionData.star_rating = data.star_rating;
+    if (data.coverage_pct != null) sessionData.coverage_pct = data.coverage_pct;
+    if (data.processHistory) sessionData.processHistory = data.processHistory;
+    if (data.totalMs) sessionData.totalMs = data.totalMs;
+    sessionData.isAgentRefined = true;
+    delete sessionData._pendingRefined;
 }
 
 function showAgentToast() {

@@ -109,15 +109,25 @@ class ProcessChunksRequest(BaseModel):
 def _strip_fences(text: str) -> str:
     return re.sub(r"^```(?:json)?\s*", "", text, flags=re.I).rstrip().rstrip("`").strip()
 
-async def _call_json_model(model_id: str, prompt: str) -> dict:
-    response = await client.aio.models.generate_content(
-        model=model_id,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        ),
-    )
-    return json.loads(_strip_fences(response.text))
+async def _call_json_model(model_id: str, prompt: str, *, _retries: int = 3) -> dict:
+    last_exc: Exception | None = None
+    for attempt in range(_retries):
+        try:
+            response = await client.aio.models.generate_content(
+                model=model_id,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            return json.loads(_strip_fences(response.text))
+        except json.JSONDecodeError:
+            raise  # malformed JSON won't improve on retry
+        except Exception as e:
+            last_exc = e
+            if attempt < _retries - 1:
+                wait = 1.5 ** attempt
+                print(f"[retry] attempt {attempt + 1} failed ({e}); retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+    raise last_exc  # type: ignore[misc]
 
 async def call_structure_model(prompt: str) -> dict:
     return await _call_json_model(STRUCTURE_MODEL, prompt)
@@ -310,13 +320,9 @@ async def process_one_chunk(
     if relevance.get("isAd"):
         return {"is_ad": True, "text": text}
 
-    stats_coro     = asyncio.get_event_loop().run_in_executor(None, get_chunk_stats, text)
-    subject_coro   = extract_subject(text)
-    eval_coro      = evaluate_chunk(text)
-    grammar_coro   = check_grammar(text)
-
-    stats, subject, evaluation, grammar = await asyncio.gather(
-        stats_coro, subject_coro, eval_coro, grammar_coro,
+    stats = get_chunk_stats(text)
+    subject, evaluation, grammar = await asyncio.gather(
+        extract_subject(text), evaluate_chunk(text), check_grammar(text),
         return_exceptions=True,
     )
 
@@ -336,7 +342,7 @@ async def process_one_chunk(
         "img_src": img_src,
         "tags": tags,
         "subject": subject.get("subject", "Untitled") if not isinstance(subject, Exception) else "Untitled",
-        "stats": stats if not isinstance(stats, Exception) else None,
+        "stats": stats,
         "evaluation": evaluation if not isinstance(evaluation, Exception) else None,
         "content_type": content_type,
     }
@@ -355,12 +361,9 @@ async def structure_content(req: StructureRequest):
     try:
         if source_words > MULTIPASS_THRESHOLD:
             sections = split_payload(payload)
-            results = []
-            for section in sections:
-                prompt = SYSTEM_PROMPT + "\n\nRAW SCRAPED CONTENT:\n" + json.dumps(section)
-                result = await call_structure_model(prompt)
-                results.append(result)
-            return merge_sections(results, source_words)
+            prompts = [SYSTEM_PROMPT + "\n\nRAW SCRAPED CONTENT:\n" + json.dumps(s) for s in sections]
+            results = await asyncio.gather(*[call_structure_model(p) for p in prompts])
+            return merge_sections(list(results), source_words)
         else:
             prompt = SYSTEM_PROMPT + "\n\nRAW SCRAPED CONTENT:\n" + json.dumps(payload)
             return await call_structure_model(prompt)

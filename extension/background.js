@@ -98,10 +98,18 @@ async function extractFromTab(tabId) {
 }
 
 async function runAgentPipeline(tabId) {
+    const { tfPipelineRunning } = await chrome.storage.session.get('tfPipelineRunning');
+    if (tfPipelineRunning) {
+        agentBroadcast(tabId, 'error', null, 'A pipeline is already running — please wait');
+        return;
+    }
+    await chrome.storage.session.set({ tfPipelineRunning: true });
+
     const t0 = Date.now();
     const sessionId = 'session_' + Date.now();
     const base = await getBackendUrl();
 
+    try {
     agentBroadcast(tabId, '[1/4] Connecting', 'backend');
 
     // Purge stale session data
@@ -200,6 +208,10 @@ async function runAgentPipeline(tabId) {
         agentBroadcast(tabId, 'error', null, `Enhancement failed: ${e.message}`);
     } finally {
         clearInterval(keepAlive);
+    }
+
+    } finally {
+        chrome.storage.session.remove('tfPipelineRunning');
     }
 }
 

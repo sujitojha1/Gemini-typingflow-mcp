@@ -22,7 +22,7 @@ if not _api_key:
 client = genai.Client(api_key=_api_key)
 
 STRUCTURE_MODEL   = os.getenv("STRUCTURE_MODEL",   "gemini-3.1-flash-lite")
-IMAGE_MODEL       = os.getenv("IMAGE_MODEL",       "gemini-2.0-flash-preview-image-generation")
+IMAGE_MODEL       = os.getenv("IMAGE_MODEL",       "gemini-2.5-flash-preview-image-generation")
 OLLAMA_URL        = os.getenv("OLLAMA_URL",        "http://localhost:11434")
 OLLAMA_TOOL_MODEL = os.getenv("OLLAMA_TOOL_MODEL", "gemma3:4b")
 

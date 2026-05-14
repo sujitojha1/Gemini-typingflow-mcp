@@ -21,9 +21,10 @@ if not _api_key:
 
 client = genai.Client(api_key=_api_key)
 
-STRUCTURE_MODEL = os.getenv("STRUCTURE_MODEL", "gemini-3.1-flash-lite")
-TOOL_MODEL      = os.getenv("TOOL_MODEL",      "gemini-2.5-flash-lite")
-IMAGE_MODEL     = os.getenv("IMAGE_MODEL",     "gemini-2.0-flash-preview-image-generation")
+STRUCTURE_MODEL   = os.getenv("STRUCTURE_MODEL",   "gemini-3.1-flash-lite")
+IMAGE_MODEL       = os.getenv("IMAGE_MODEL",       "gemini-2.0-flash-preview-image-generation")
+OLLAMA_URL        = os.getenv("OLLAMA_URL",        "http://localhost:11434")
+OLLAMA_TOOL_MODEL = os.getenv("OLLAMA_TOOL_MODEL", "gemma3:4b")
 
 CONCURRENCY_LIMIT    = int(os.getenv("CONCURRENCY_LIMIT", "5"))
 MULTIPASS_THRESHOLD  = int(os.getenv("MULTIPASS_WORD_THRESHOLD", "3000"))
@@ -132,8 +133,28 @@ async def _call_json_model(model_id: str, prompt: str, *, _retries: int = 3) -> 
 async def call_structure_model(prompt: str) -> dict:
     return await _call_json_model(STRUCTURE_MODEL, prompt)
 
+async def _call_ollama_json(prompt: str, *, _retries: int = 3) -> dict:
+    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
+    payload = {"model": OLLAMA_TOOL_MODEL, "prompt": prompt, "format": "json", "stream": False}
+    last_exc: Exception | None = None
+    for attempt in range(_retries):
+        try:
+            async with httpx.AsyncClient(timeout=60) as hc:
+                r = await hc.post(url, json=payload)
+                r.raise_for_status()
+                return json.loads(_strip_fences(r.json().get("response", "")))
+        except json.JSONDecodeError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < _retries - 1:
+                wait = 1.5 ** attempt
+                print(f"[ollama-retry] attempt {attempt + 1} failed ({e}); retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
 async def call_tool_model(prompt: str) -> dict:
-    return await _call_json_model(TOOL_MODEL, prompt)
+    return await _call_ollama_json(prompt)
 
 async def call_image_model(prompt: str) -> str | None:
     try:
@@ -349,9 +370,28 @@ async def process_one_chunk(
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
 
+_EMBED_PATTERNS = re.compile(r"embed|embedding", re.I)
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "models": {"structure": STRUCTURE_MODEL, "tool": TOOL_MODEL, "image": IMAGE_MODEL}}
+    return {"status": "ok", "models": {"structure": STRUCTURE_MODEL, "tool": f"ollama/{OLLAMA_TOOL_MODEL}", "image": IMAGE_MODEL}}
+
+@app.get("/api/ollama/models")
+async def list_ollama_models():
+    """Return locally available Ollama models, excluding embedding-only models."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as hc:
+            r = await hc.get(f"{OLLAMA_URL.rstrip('/')}/api/tags")
+            r.raise_for_status()
+            all_models = r.json().get("models", [])
+        models = [
+            {"name": m["name"], "size_gb": round(m.get("size", 0) / 1e9, 1)}
+            for m in all_models
+            if not _EMBED_PATTERNS.search(m["name"])
+        ]
+        return {"models": models, "current": OLLAMA_TOOL_MODEL}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama not reachable: {e}")
 
 @app.post("/api/structure")
 async def structure_content(req: StructureRequest):

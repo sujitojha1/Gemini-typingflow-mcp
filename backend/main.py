@@ -297,7 +297,7 @@ Rules:
 - Never run check_grammar or generate_image on code or data chunks.
 - Never run generate_image on definitions — they're text-only by nature.
 
-Return ONLY valid JSON: {"tools": ["extract_subject", "evaluate_chunk", ...], "reason": "<one sentence>"}
+Return ONLY valid JSON: {{"tools": ["extract_subject", "evaluate_chunk", ...], "reason": "<one sentence>"}}
 
 content_type: {content_type}
 text (first 300 chars): {text}"""

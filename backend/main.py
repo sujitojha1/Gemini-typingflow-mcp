@@ -12,6 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from tools import (
+    call_ollama_json,
+    check_grammar,
+    check_relevance,
+    evaluate_chunk,
+    extract_subject,
+    get_chunk_stats,
+    refine_chunk,
+    strip_fences,
+)
 
 load_dotenv()
 
@@ -29,6 +39,11 @@ OLLAMA_TOOL_MODEL = os.getenv("OLLAMA_TOOL_MODEL", "gemma3:4b")
 CONCURRENCY_LIMIT    = int(os.getenv("CONCURRENCY_LIMIT", "5"))
 MULTIPASS_THRESHOLD  = int(os.getenv("MULTIPASS_WORD_THRESHOLD", "3000"))
 SECTION_MAX_WORDS    = int(os.getenv("SECTION_MAX_WORDS", "2000"))
+COVERAGE_MIN_PCT     = int(os.getenv("COVERAGE_MIN_PCT", "80"))
+QUALITY_MIN_SCORE    = int(os.getenv("QUALITY_MIN_SCORE", "2"))
+
+# Global semaphore — shared across all concurrent requests
+_chunk_semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
 app = FastAPI(title="TypingFlow API")
 app.add_middleware(
@@ -156,9 +171,6 @@ class ChunkStats(BaseModel):
 
 # ── Gemini helpers ─────────────────────────────────────────────────────────────
 
-def _strip_fences(text: str) -> str:
-    return re.sub(r"^```(?:json)?\s*", "", text, flags=re.I).rstrip().rstrip("`").strip()
-
 async def _call_json_model(model_id: str, prompt: str, *, _retries: int = 3) -> dict:
     last_exc: Exception | None = None
     for attempt in range(_retries):
@@ -168,7 +180,7 @@ async def _call_json_model(model_id: str, prompt: str, *, _retries: int = 3) -> 
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
-            return json.loads(_strip_fences(response.text))
+            return json.loads(strip_fences(response.text))
         except json.JSONDecodeError:
             raise  # malformed JSON won't improve on retry
         except Exception as e:
@@ -181,29 +193,6 @@ async def _call_json_model(model_id: str, prompt: str, *, _retries: int = 3) -> 
 
 async def call_structure_model(prompt: str) -> dict:
     return await _call_json_model(STRUCTURE_MODEL, prompt)
-
-async def _call_ollama_json(prompt: str, *, _retries: int = 3) -> dict:
-    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
-    payload = {"model": OLLAMA_TOOL_MODEL, "prompt": prompt, "format": "json", "stream": False}
-    last_exc: Exception | None = None
-    for attempt in range(_retries):
-        try:
-            async with httpx.AsyncClient(timeout=60) as hc:
-                r = await hc.post(url, json=payload)
-                r.raise_for_status()
-                return json.loads(_strip_fences(r.json().get("response", "")))
-        except json.JSONDecodeError:
-            raise
-        except Exception as e:
-            last_exc = e
-            if attempt < _retries - 1:
-                wait = 1.5 ** attempt
-                print(f"[ollama-retry] attempt {attempt + 1} failed ({e}); retrying in {wait:.1f}s")
-                await asyncio.sleep(wait)
-    raise last_exc  # type: ignore[misc]
-
-async def call_tool_model(prompt: str) -> dict:
-    return await _call_ollama_json(prompt)
 
 async def call_image_model(prompt: str) -> str | None:
     try:
@@ -269,105 +258,19 @@ def merge_sections(outputs: list[dict], source_words: int) -> dict:
     avg_rating = round(sum(ratings) / len(ratings)) if ratings else 3
     nugget_words = sum(len((n.get("text") or "").split()) for n in all_nuggets)
     coverage = min(99, round(nugget_words / source_words * 100)) if source_words else 85
+    # Combine TLDRs from all sections rather than silently dropping all but the first
+    tldrs = [o.get("tldr", "") for o in outputs if o.get("tldr")]
+    combined_tldr = " | ".join(tldrs) if len(tldrs) > 1 else (tldrs[0] if tldrs else "")
+    if coverage < COVERAGE_MIN_PCT:
+        print(f"[coverage] merged coverage {coverage}% is below {COVERAGE_MIN_PCT}% threshold "
+              f"({nugget_words} nugget words / {source_words} source words)")
     return {
-        "tldr": outputs[0].get("tldr", "") if outputs else "",
+        "tldr": combined_tldr,
         "tags": all_tags,
         "star_rating": avg_rating,
         "coverage_pct": coverage,
         "nuggets": all_nuggets,
     }
-
-# ── Tool implementations ───────────────────────────────────────────────────────
-
-_HEURISTIC_PATTERNS = [
-    r"^(accept all|cookie|privacy policy|subscribe|sign up|log in|advertisement|sponsored content|share this|tweet|follow us|newsletter|related articles|you might also like|read more|breadcrumb)",
-    r"(\d+% off|buy now|limited offer|click here|free trial|terms of service|all rights reserved|©\s*\d{4})",
-]
-
-async def check_relevance(text: str) -> dict:
-    if len(text.strip()) < 50:
-        return {"isAd": True, "reason": "Too short — likely boilerplate"}
-    for pat in _HEURISTIC_PATTERNS:
-        if re.search(pat, text, re.I):
-            return {"isAd": True, "reason": "Heuristic: boilerplate or promotional content"}
-    words = text.split()
-    if len(words) < 12 and re.search(r"^(by |home\s*[>›/]|share|tweet|facebook|linkedin|email this)", text, re.I):
-        return {"isAd": True, "reason": "Heuristic: short social/byline fragment"}
-
-    prompt = (
-        f'Analyze this text and determine if it is irrelevant to a learning session. '
-        f'Irrelevant content includes: ads, nav, cookie notices, social buttons, newsletter prompts, '
-        f'author bios under 2 sentences, related-articles lists, footer text, or other boilerplate. '
-        f'Return ONLY valid JSON: {{"isAd":<bool>,"reason":"<one sentence>"}}\n\nContent:\n{text}'
-    )
-    try:
-        return await call_tool_model(prompt)
-    except Exception:
-        return {"isAd": False, "reason": "API error — treating as relevant"}
-
-def get_chunk_stats(text: str) -> dict:
-    words = text.split()
-    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
-    avg_len = sum(len(w) for w in words) / len(words) if words else 0
-    return {
-        "word_count": len(words),
-        "char_count": len(text),
-        "sentence_count": len(sentences),
-        "avg_word_length": round(avg_len, 1),
-    }
-
-async def extract_subject(text: str) -> dict:
-    cleaned = re.sub(r"^[\s\S]{0,120}?(by\s+\w[\w\s]+·|©|\d{4}|min read)", "", text, flags=re.I).strip() or text
-    prompt = (
-        f'Extract a concise subject title (4–8 words) for this learning chunk. '
-        f'Return ONLY valid JSON: {{"subject":"<title>"}}\n\nCHUNK:\n{cleaned[:800]}'
-    )
-    try:
-        result = await call_tool_model(prompt)
-        return {"subject": result.get("subject") or "Untitled"}
-    except Exception:
-        return {"subject": "Untitled"}
-
-async def evaluate_chunk(text: str) -> dict:
-    prompt = (
-        f'Evaluate this learning chunk. Rubric — 1=incomprehensible, 2=hard to follow, '
-        f'3=surface-level, 4=clear+useful, 5=rich insight. Apply to score, clarity, completeness. '
-        f'Return ONLY valid JSON: {{"score":<1-5>,"clarity":<1-5>,"completeness":<1-5>,'
-        f'"critique":"<one sentence>","suggestions":"<one sentence>"}}\n\nContent:\n{text}'
-    )
-    try:
-        return await call_tool_model(prompt)
-    except Exception:
-        return {"score": None, "clarity": None, "completeness": None, "critique": "API error", "suggestions": ""}
-
-async def check_grammar(text: str) -> dict:
-    prompt = (
-        f'Check grammar, spelling, and sentence structure. '
-        f'Return ONLY valid JSON: {{"isProper":<bool>,"issues":"<comma-separated list or empty string>"}}\n\nContent:\n{text}'
-    )
-    try:
-        return await call_tool_model(prompt)
-    except Exception:
-        return {"isProper": True, "issues": ""}
-
-async def refine_chunk(text: str, grammar: dict, evaluation: dict) -> dict:
-    prompt = (
-        f'Fix ONLY the listed grammar issues. Preserve author voice, ALL facts, and original terminology. '
-        f'Do NOT add new information. Keep under 300 words. '
-        f'Return ONLY valid JSON: {{"refinedText":"<corrected text>"}}\n\n'
-        f'Original:\n{text}\n\nGrammar issues:\n{grammar.get("issues","N/A")}\n\n'
-        f'Evaluation (context only — do not add content):\n'
-        f'Score: {evaluation.get("score","N/A")}/5\nCritique: {evaluation.get("critique","N/A")}'
-    )
-    try:
-        result = await call_tool_model(prompt)
-        refined = result.get("refinedText") or text
-        words = refined.split()
-        if len(words) > 300:
-            refined = " ".join(words[:300]) + "…"
-        return {"refinedText": refined}
-    except Exception:
-        return {"refinedText": text}
 
 async def generate_image_for_chunk(text: str, tags: list[str]) -> str | None:
     prompt = (
@@ -377,30 +280,105 @@ async def generate_image_for_chunk(text: str, tags: list[str]) -> str | None:
     img = await call_image_model(prompt)
     return img or await picsum_fallback(tags)
 
-# ── Single chunk processing ────────────────────────────────────────────────────
+# ── Agentic chunk processing ───────────────────────────────────────────────────
+
+_AGENT_PLAN_PROMPT = """\
+You are a learning content processor agent. Given a text chunk and its content_type, decide which tools to apply.
+
+Available tools (use their exact names):
+  extract_subject   — always include; extracts a 4–8 word title
+  evaluate_chunk    — always include; scores quality 1–5
+  check_grammar     — include for narrative/technical/definition/example; OMIT for code/data
+  generate_image    — include for narrative/technical/example; OMIT for definition/code/data
+
+Rules:
+- Always include extract_subject and evaluate_chunk.
+- Never run check_grammar or generate_image on code or data chunks.
+- Never run generate_image on definitions — they're text-only by nature.
+
+Return ONLY valid JSON: {"tools": ["extract_subject", "evaluate_chunk", ...], "reason": "<one sentence>"}
+
+content_type: {content_type}
+text (first 300 chars): {text}"""
+
+_VALID_PLAN_TOOLS = {"extract_subject", "evaluate_chunk", "check_grammar", "generate_image"}
+_REQUIRED_PLAN_TOOLS = {"extract_subject", "evaluate_chunk"}
+
+
+def _fallback_tool_plan(content_type: str | None) -> list[str]:
+    """Content-type-aware default plan when the LLM planner fails."""
+    plan = ["extract_subject", "evaluate_chunk"]
+    if content_type not in ("code", "data"):
+        plan.append("check_grammar")
+    if content_type not in ("definition", "code", "data"):
+        plan.append("generate_image")
+    return plan
+
+
+async def _plan_chunk_tools(text: str, content_type: str | None) -> list[str]:
+    """Ask the LLM which tools to apply to this chunk. Falls back to content_type routing."""
+    prompt = _AGENT_PLAN_PROMPT.format(
+        content_type=content_type or "unknown",
+        text=text[:300],
+    )
+    try:
+        result = await call_ollama_json(prompt)
+        raw = result.get("tools", [])
+        tools = [t for t in raw if t in _VALID_PLAN_TOOLS]
+        # Enforce required tools regardless of what the LLM decided
+        for req in _REQUIRED_PLAN_TOOLS:
+            if req not in tools:
+                tools.insert(0, req)
+        print(f"[agent] plan={tools} reason={result.get('reason', '')!r}")
+        return tools
+    except Exception as e:
+        print(f"[agent] planning failed ({e}), using content_type fallback")
+        return _fallback_tool_plan(content_type)
+
 
 async def process_one_chunk(nugget: Nugget, global_tags: list[str]) -> dict:
     text = nugget.text
     tags = nugget.tags or global_tags
+    content_type = nugget.content_type
 
     relevance = await check_relevance(text)
     if relevance.get("isAd"):
         return {"is_ad": True, "text": text}
 
-    # Start image generation early — runs concurrently with analysis pipeline
-    img_task: asyncio.Task | None = None
-    if not nugget.img_src:
-        img_task = asyncio.create_task(generate_image_for_chunk(text, tags))
+    # LLM plans which tools to run; falls back to content_type routing on failure
+    tool_plan = await _plan_chunk_tools(text, content_type)
 
     stats = get_chunk_stats(text)
-    subject, evaluation, grammar = await asyncio.gather(
-        extract_subject(text), evaluate_chunk(text), check_grammar(text),
-        return_exceptions=True,
-    )
 
+    # Kick off image generation early if planned and no image already attached
+    img_task: asyncio.Task | None = None
+    if "generate_image" in tool_plan and not nugget.img_src:
+        img_task = asyncio.create_task(generate_image_for_chunk(text, tags))
+
+    # Run extract_subject, evaluate_chunk, and optionally check_grammar in parallel
+    parallel: list[Any] = [extract_subject(text), evaluate_chunk(text)]
+    run_grammar = "check_grammar" in tool_plan
+    if run_grammar:
+        parallel.append(check_grammar(text))
+
+    gathered = await asyncio.gather(*parallel, return_exceptions=True)
+    subject = gathered[0]
+    evaluation = gathered[1]
+    grammar: dict | Exception = gathered[2] if run_grammar else {"isProper": True, "issues": ""}
+
+    # Evaluation score feedback: discard low-quality chunks early
+    eval_result = evaluation if not isinstance(evaluation, Exception) else {}
+    eval_score = (eval_result or {}).get("score")
+    if eval_score is not None and eval_score < QUALITY_MIN_SCORE:
+        if img_task:
+            img_task.cancel()
+        print(f"[quality] filtering chunk score={eval_score}: {text[:60]!r}")
+        return {"is_ad": False, "low_quality": True, "text": text, "score": eval_score}
+
+    # Refine only when grammar issues were found and the plan included grammar checking
     refined_text = text
-    if not isinstance(grammar, Exception) and not grammar.get("isProper", True):
-        refined = await refine_chunk(text, grammar, evaluation if not isinstance(evaluation, Exception) else {})
+    if run_grammar and not isinstance(grammar, Exception) and not grammar.get("isProper", True):
+        refined = await refine_chunk(text, grammar, eval_result or {})
         refined_text = refined.get("refinedText", text)
 
     img_src = nugget.img_src or (await img_task if img_task else None)
@@ -413,8 +391,8 @@ async def process_one_chunk(nugget: Nugget, global_tags: list[str]) -> dict:
         "tags": tags,
         "subject": subject.get("subject", "Untitled") if not isinstance(subject, Exception) else "Untitled",
         "stats": stats,
-        "evaluation": evaluation if not isinstance(evaluation, Exception) else None,
-        "content_type": nugget.content_type,
+        "evaluation": eval_result or None,
+        "content_type": content_type,
     }
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
@@ -464,7 +442,7 @@ async def structure_content(req: StructureRequest):
 @app.post("/api/tool")
 async def run_tool(req: ToolRequest):
     try:
-        return await call_tool_model(req.prompt)
+        return await call_ollama_json(req.prompt)
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=422, detail=f"Model returned invalid JSON: {e}")
     except Exception as e:
@@ -472,10 +450,8 @@ async def run_tool(req: ToolRequest):
 
 @app.post("/api/process-chunks", response_model=ProcessChunksResponse)
 async def process_chunks(req: ProcessChunksRequest):
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-
     async def bounded(nugget: Nugget) -> dict:
-        async with semaphore:
+        async with _chunk_semaphore:
             return await process_one_chunk(nugget, req.tags)
 
     tasks = [bounded(nugget) for nugget in req.nuggets]
@@ -487,6 +463,8 @@ async def process_chunks(req: ProcessChunksRequest):
             print(f"[chunks] chunk error: {r}")
             continue
         if r.get("is_ad"):
+            continue
+        if r.get("low_quality"):
             continue
         valid_nuggets.append({
             "text": r.get("refined_text") or r.get("text", ""),

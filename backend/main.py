@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import re
+import traceback
 from typing import Any, Literal
 
 import httpx
@@ -460,7 +461,8 @@ async def process_chunks(req: ProcessChunksRequest):
     valid_nuggets = []
     for r in results:
         if isinstance(r, Exception):
-            print(f"[chunks] chunk error: {r}")
+            tb = "".join(traceback.format_exception(type(r), r, r.__traceback__))
+            print(f"[chunks] chunk error ({type(r).__name__}): {r}\n{tb}")
             continue
         if r.get("is_ad"):
             continue

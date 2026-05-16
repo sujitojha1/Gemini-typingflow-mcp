@@ -32,8 +32,11 @@ async def call_ollama_json(prompt: str, *, retries: int = 3) -> dict:
             async with httpx.AsyncClient(timeout=60) as hc:
                 r = await hc.post(url, json=payload)
                 r.raise_for_status()
-                return json.loads(strip_fences(r.json().get("response", "")))
-        except json.JSONDecodeError:
+                result = json.loads(strip_fences(r.json().get("response", "")))
+                if not isinstance(result, dict):
+                    raise ValueError(f"expected JSON object, got {type(result).__name__}: {result!r:.80}")
+                return result
+        except (json.JSONDecodeError, ValueError):
             raise
         except Exception as e:
             last_exc = e

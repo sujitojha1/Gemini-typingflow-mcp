@@ -1,21 +1,22 @@
 """
-Session 3 - Demo 10: The Full Agent
-This is the complete agent with the agentic loop.
-Everything from the session comes together here.
+Session 3 - Demo 10: The Full Agent (async)
+This is the complete agent with the agentic loop — fully async.
 
 Before running:
-  pip install google-genai python-dotenv
+  pip install google-genai python-dotenv fastmcp
   Create a .env file next to this script with:
     GEMINI_API_KEY=your-key-here
     GEMINI_MODEL=gemini-2.5-flash-lite
 """
-from google import genai
+import asyncio
 import json
-import re
 import math
 import os
-import time
+import re
+
 from dotenv import load_dotenv
+from google import genai
+from pydantic import BaseModel
 
 # ============================================================
 # Configuration
@@ -24,7 +25,7 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
-THROTTLE_SECONDS = 10  # Wait before each LLM call to stay under free-tier RPM limits
+THROTTLE_SECONDS = 10  # free-tier RPM guard
 
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set. Create a .env file with GEMINI_API_KEY=...")
@@ -32,15 +33,30 @@ if not GEMINI_API_KEY:
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-def call_llm(prompt: str) -> str:
-    """Send a prompt to Gemini and return the text response.
+# ── Pydantic schemas for tool arguments & responses ────────────────────────────
 
-    Sleeps for THROTTLE_SECONDS before each call to stay under the free-tier
-    rate limit (Gemini 3.1 Flash Lite: 15 RPM, 500 RPD).
-    """
+class CalculateArgs(BaseModel):
+    expression: str
+
+class WeatherArgs(BaseModel):
+    city: str
+
+class SearchNotesArgs(BaseModel):
+    query: str
+
+class ToolCall(BaseModel):
+    tool_name: str
+    tool_arguments: dict
+
+class FinalAnswer(BaseModel):
+    answer: str
+
+
+async def call_llm(prompt: str) -> str:
+    """Send a prompt to Gemini asynchronously; throttle to respect free-tier RPM."""
     print(f"  [waiting {THROTTLE_SECONDS}s to respect rate limits...]", flush=True)
-    time.sleep(THROTTLE_SECONDS)
-    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    await asyncio.sleep(THROTTLE_SECONDS)
+    response = await client.aio.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     return response.text
 
 
@@ -81,68 +97,58 @@ IMPORTANT RULES:
 
 
 # ============================================================
-# Tools — The functions the agent can call
+# Tools — async functions the agent can call
 # ============================================================
 
-def calculate(expression: str) -> str:
-    """Evaluate a mathematical expression safely"""
+async def calculate(expression: str) -> str:
+    """Evaluate a mathematical expression safely."""
+    args = CalculateArgs(expression=expression)
     try:
-        # Allow math functions in the expression
         allowed = {
-            "math": math,
-            "abs": abs,
-            "round": round,
-            "pow": pow,
-            "sum": sum,
-            "min": min,
-            "max": max,
-            "range": range,
-            "list": list,
+            "math": math, "abs": abs, "round": round, "pow": pow,
+            "sum": sum, "min": min, "max": max, "range": range, "list": list,
         }
-        result = eval(expression, {"__builtins__": {}}, allowed)
+        result = eval(args.expression, {"__builtins__": {}}, allowed)
         return json.dumps({"result": str(result)})
     except Exception as e:
-        return json.dumps({"error": f"Calculation failed: {str(e)}"})
+        return json.dumps({"error": f"Calculation failed: {e}"})
 
 
-def get_weather(city: str) -> str:
-    """Get current weather for a city (simulated)"""
-    # In a real agent, this would call a weather API like OpenWeatherMap
+async def get_weather(city: str) -> str:
+    """Get current weather for a city (simulated; swap for a real API call)."""
+    args = WeatherArgs(city=city)
     weather_data = {
-        "Mumbai": {"temp": "32°C", "condition": "Humid, Partly Cloudy", "humidity": "78%"},
-        "Delhi": {"temp": "28°C", "condition": "Clear Sky", "humidity": "45%"},
-        "London": {"temp": "15°C", "condition": "Rainy", "humidity": "85%"},
-        "New York": {"temp": "22°C", "condition": "Sunny", "humidity": "55%"},
-        "Tokyo": {"temp": "26°C", "condition": "Windy", "humidity": "60%"},
-        "San Francisco": {"temp": "18°C", "condition": "Foggy", "humidity": "72%"},
+        "Mumbai":        {"temp": "32°C", "condition": "Humid, Partly Cloudy", "humidity": "78%"},
+        "Delhi":         {"temp": "28°C", "condition": "Clear Sky",            "humidity": "45%"},
+        "London":        {"temp": "15°C", "condition": "Rainy",                "humidity": "85%"},
+        "New York":      {"temp": "22°C", "condition": "Sunny",                "humidity": "55%"},
+        "Tokyo":         {"temp": "26°C", "condition": "Windy",                "humidity": "60%"},
+        "San Francisco": {"temp": "18°C", "condition": "Foggy",                "humidity": "72%"},
     }
-    if city in weather_data:
-        return json.dumps({"weather": weather_data[city]})
-    return json.dumps({"error": f"Weather data not available for {city}"})
+    if args.city in weather_data:
+        return json.dumps({"weather": weather_data[args.city]})
+    return json.dumps({"error": f"Weather data not available for {args.city}"})
 
 
-def search_notes(query: str) -> str:
-    """Search through user's notes (simulated)"""
+async def search_notes(query: str) -> str:
+    """Search through user's notes (simulated)."""
+    args = SearchNotesArgs(query=query)
     notes = [
-        {"title": "Meeting Agenda", "content": "Discuss Q3 targets, review agent architecture, plan MCP integration"},
-        {"title": "Shopping List", "content": "Milk, eggs, bread, coffee, batteries"},
-        {"title": "Project Ideas", "content": "Build a stock monitoring agent, voice-based assistant, browser automation tool"},
-        {"title": "Travel Plans", "content": "Tokyo trip in December, need to book flights and hotel by November"},
-        {"title": "Learning Notes", "content": "Finish transformer session, practice async Python, read MCP docs"},
+        {"title": "Meeting Agenda",  "content": "Discuss Q3 targets, review agent architecture, plan MCP integration"},
+        {"title": "Shopping List",   "content": "Milk, eggs, bread, coffee, batteries"},
+        {"title": "Project Ideas",   "content": "Build a stock monitoring agent, voice-based assistant, browser automation tool"},
+        {"title": "Travel Plans",    "content": "Tokyo trip in December, need to book flights and hotel by November"},
+        {"title": "Learning Notes",  "content": "Finish transformer session, practice async Python, read MCP docs"},
     ]
-    results = [
-        n for n in notes
-        if query.lower() in n["title"].lower() or query.lower() in n["content"].lower()
-    ]
-    if results:
-        return json.dumps({"results": results})
-    return json.dumps({"results": "No notes found matching your query"})
+    q = args.query.lower()
+    results = [n for n in notes if q in n["title"].lower() or q in n["content"].lower()]
+    return json.dumps({"results": results or "No notes found matching your query"})
 
 
-# Tool registry — maps tool names to functions
-tools = {
-    "calculate": calculate,
-    "get_weather": get_weather,
+# Tool registry — maps tool names to async functions
+tools: dict[str, any] = {
+    "calculate":    calculate,
+    "get_weather":  get_weather,
     "search_notes": search_notes,
 }
 
@@ -189,30 +195,25 @@ def parse_llm_response(text: str) -> dict:
 # The Agent Loop — This is where the magic happens
 # ============================================================
 
-def run_agent(user_query: str, max_iterations: int = 5, verbose: bool = True):
+async def run_agent(user_query: str, max_iterations: int = 5, verbose: bool = True) -> str | None:
     """
-    Run the agent loop:
-    User query → LLM → [Tool call → Result → LLM]* → Final answer
-
-    This is THE pattern. Everything else in this course builds on this loop.
+    Async agent loop: User query → LLM → [Tool call → Result → LLM]* → Final answer.
+    Tools run as coroutines; the loop awaits each tool result before the next LLM call.
     """
     if verbose:
         print(f"\n{'='*60}")
         print(f"  User: {user_query}")
         print(f"{'='*60}")
 
-    # Conversation history — this is the agent's "working memory"
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_query},
+        {"role": "system",  "content": system_prompt},
+        {"role": "user",    "content": user_query},
     ]
 
     for iteration in range(max_iterations):
         if verbose:
             print(f"\n--- Iteration {iteration + 1} ---")
 
-        # Build prompt from message history
-        # Each iteration, the LLM sees EVERYTHING that happened before
         prompt = ""
         for msg in messages:
             if msg["role"] == "system":
@@ -224,66 +225,58 @@ def run_agent(user_query: str, max_iterations: int = 5, verbose: bool = True):
             elif msg["role"] == "tool":
                 prompt += f"Tool Result: {msg['content']}\n\n"
 
-        # Call the LLM
-        response_text = call_llm(prompt)
+        response_text = await call_llm(prompt)
         if verbose:
             print(f"LLM: {response_text.strip()}")
 
-        # Parse the response
         try:
             parsed = parse_llm_response(response_text)
         except (ValueError, json.JSONDecodeError) as e:
             if verbose:
-                print(f"Parse error: {e}")
-                print("Asking LLM to retry...")
+                print(f"Parse error: {e} — asking LLM to retry...")
             messages.append({"role": "assistant", "content": response_text})
             messages.append({"role": "user", "content": "Please respond with valid JSON only. No markdown, no extra text."})
             continue
 
-        # Check if it's a final answer
         if "answer" in parsed:
+            answer = FinalAnswer(**parsed).answer
             if verbose:
                 print(f"\n{'='*60}")
-                print(f"  Agent Answer: {parsed['answer']}")
+                print(f"  Agent Answer: {answer}")
                 print(f"{'='*60}")
-            return parsed["answer"]
+            return answer
 
-        # It's a tool call — execute it
         if "tool_name" in parsed:
-            tool_name = parsed["tool_name"]
-            tool_args = parsed.get("tool_arguments", {})
+            try:
+                call = ToolCall(**parsed)
+            except Exception as e:
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "tool", "content": json.dumps({"error": f"Bad tool call schema: {e}"})})
+                continue
 
             if verbose:
-                print(f"→ Calling tool: {tool_name}({tool_args})")
+                print(f"→ Calling tool: {call.tool_name}({call.tool_arguments})")
 
-            # Check if tool exists
-            if tool_name not in tools:
-                error_msg = json.dumps({"error": f"Unknown tool: {tool_name}. Available: {list(tools.keys())}"})
+            if call.tool_name not in tools:
+                error_msg = json.dumps({"error": f"Unknown tool: {call.tool_name}. Available: {list(tools.keys())}"})
                 if verbose:
                     print(f"→ Error: {error_msg}")
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "tool", "content": error_msg})
                 continue
 
-            # Execute the tool
-            tool_result = tools[tool_name](**tool_args)
+            tool_result = await tools[call.tool_name](**call.tool_arguments)
             if verbose:
                 print(f"→ Result: {tool_result}")
 
-            # Add to conversation history — the LLM will see this next iteration
             messages.append({"role": "assistant", "content": response_text})
             messages.append({"role": "tool", "content": tool_result})
 
     print("\nMax iterations reached. Agent could not complete the task.")
-
-    # Print full conversation for debugging
     if verbose:
-        print(f"\n{'='*60}")
-        print("Full conversation history:")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nFull conversation history:\n{'='*60}")
         for i, msg in enumerate(messages):
             print(f"[{i}] {msg['role']}: {msg['content'][:100]}...")
-
     return None
 
 
@@ -291,34 +284,32 @@ def run_agent(user_query: str, max_iterations: int = 5, verbose: bool = True):
 # Run the agent!
 # ============================================================
 
-if __name__ == "__main__":
+async def main() -> None:
     print("\n" + "=" * 60)
-    print("  SESSION 3: YOUR FIRST AI AGENT")
-    print("  Let's see the agent loop in action!")
+    print("  SESSION 3: YOUR FIRST AI AGENT (async)")
     print("=" * 60)
 
-    # Test 1: Simple tool call
     print("\n\n>>> TEST 1: Simple weather query")
-    run_agent("What is the weather in Mumbai?")
+    await run_agent("What is the weather in Mumbai?")
 
-    # Test 2: Calculation
     print("\n\n>>> TEST 2: Math that LLMs get wrong")
-    run_agent("What is 2 raised to the power of 10, plus the square root of 144?")
+    await run_agent("What is 2 raised to the power of 10, plus the square root of 144?")
 
-    # Test 3: Multi-step — needs multiple tool calls
     print("\n\n>>> TEST 3: Multi-step reasoning")
-    run_agent(
+    await run_agent(
         "Search my notes for travel plans, then check the weather in "
         "the city I'm planning to visit."
     )
 
-    # Test 4: The assignment example!
     print("\n\n>>> TEST 4: The classic — sum of exponentials of Fibonacci")
-    run_agent(
+    await run_agent(
         "Calculate the sum of exponential values (e^x) of the "
         "first 6 Fibonacci numbers: 1, 1, 2, 3, 5, 8"
     )
 
-    # Test 5: Something that doesn't need tools
     print("\n\n>>> TEST 5: No tools needed")
-    run_agent("What is the capital of France?")
+    await run_agent("What is the capital of France?")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

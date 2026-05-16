@@ -97,17 +97,25 @@ async function extractFromTab(tabId) {
     return null;
 }
 
+const PIPELINE_LOCK_TTL_MS = 6 * 60 * 1000; // 6 min — longer than worst-case pipeline
+
 async function runAgentPipeline(tabId) {
-    const { tfPipelineRunning } = await chrome.storage.session.get('tfPipelineRunning');
-    if (tfPipelineRunning) {
+    const { tfPipelineRunning, tfPipelineStartedAt } = await chrome.storage.session.get(
+        ['tfPipelineRunning', 'tfPipelineStartedAt']
+    );
+    const isStale = tfPipelineRunning && (Date.now() - (tfPipelineStartedAt || 0)) > PIPELINE_LOCK_TTL_MS;
+    if (tfPipelineRunning && !isStale) {
         agentBroadcast(tabId, 'error', null, 'A pipeline is already running — please wait');
         return;
     }
-    await chrome.storage.session.set({ tfPipelineRunning: true });
+    await chrome.storage.session.set({ tfPipelineRunning: true, tfPipelineStartedAt: Date.now() });
 
     const t0 = Date.now();
     const sessionId = 'session_' + Date.now();
     const base = await getBackendUrl();
+
+    // Keep the service worker alive for the entire pipeline (Track 1 + Track 2)
+    const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
 
     try {
     agentBroadcast(tabId, '[1/4] Connecting', 'backend');
@@ -182,7 +190,6 @@ async function runAgentPipeline(tabId) {
     agentBroadcast(tabId, 'Done [1-4]', 'backend', `${nuggets.length} nuggets · ${Date.now() - t0}ms`);
 
     // ── Track 2: Parallel enhancement ────────────────────────────────────────
-    const keepAlive = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
     try {
         agentBroadcast(tabId, '[Agent] Enhancing', 'backend', `${nuggets.length} chunks`);
         const res = await fetchWithTimeout(`${base}/api/process-chunks`, {
@@ -206,12 +213,11 @@ async function runAgentPipeline(tabId) {
         agentBroadcast(tabId, 'refined', 'backend', `${refined.nuggets?.length || 0} nuggets enhanced`);
     } catch (e) {
         agentBroadcast(tabId, 'error', null, `Enhancement failed: ${e.message}`);
-    } finally {
-        clearInterval(keepAlive);
     }
 
     } finally {
-        chrome.storage.session.remove('tfPipelineRunning');
+        clearInterval(keepAlive);
+        chrome.storage.session.remove(['tfPipelineRunning', 'tfPipelineStartedAt']);
     }
 }
 

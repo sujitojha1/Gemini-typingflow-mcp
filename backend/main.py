@@ -3,7 +3,7 @@ import base64
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -85,8 +85,10 @@ EXPECTED JSON SCHEMA:
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
+ContentType = Literal["narrative", "technical", "code", "data", "definition", "example"]
+
 class ContentItem(BaseModel):
-    type: str
+    type: Literal["text", "image"]
     content: str | None = None
     src: str | None = None
 
@@ -100,10 +102,57 @@ class ImageRequest(BaseModel):
     text: str
     tags: list[str] = []
 
+class Nugget(BaseModel):
+    text: str
+    img_src: str | None = None
+    tags: list[str] = []
+    content_type: ContentType | None = None
+
 class ProcessChunksRequest(BaseModel):
-    nuggets: list[dict[str, Any]]
+    nuggets: list[Nugget]
     image_index: list[dict[str, Any]] = []
     tags: list[str] = []
+
+# ── Response models ────────────────────────────────────────────────────────────
+
+class ProcessedNugget(BaseModel):
+    text: str
+    img_src: str | None = None
+    tags: list[str] = []
+    subject: str = "Untitled"
+    stats: dict[str, Any] | None = None
+    score: int | None = None
+    content_type: ContentType | None = None
+
+class ProcessChunksResponse(BaseModel):
+    nuggets: list[ProcessedNugget]
+
+class RelevanceResult(BaseModel):
+    isAd: bool
+    reason: str
+
+class SubjectResult(BaseModel):
+    subject: str
+
+class EvaluationResult(BaseModel):
+    score: int | None = Field(None, ge=1, le=5)
+    clarity: int | None = Field(None, ge=1, le=5)
+    completeness: int | None = Field(None, ge=1, le=5)
+    critique: str = ""
+    suggestions: str = ""
+
+class GrammarResult(BaseModel):
+    isProper: bool
+    issues: str = ""
+
+class RefinedResult(BaseModel):
+    refinedText: str
+
+class ChunkStats(BaseModel):
+    word_count: int
+    char_count: int
+    sentence_count: int
+    avg_word_length: float
 
 # ── Gemini helpers ─────────────────────────────────────────────────────────────
 
@@ -330,16 +379,18 @@ async def generate_image_for_chunk(text: str, tags: list[str]) -> str | None:
 
 # ── Single chunk processing ────────────────────────────────────────────────────
 
-async def process_one_chunk(
-    nugget: dict, idx: int, total: int, image_index: list[dict], global_tags: list[str]
-) -> dict:
-    text = nugget.get("text") or ""
-    tags = nugget.get("tags") or global_tags or []
-    content_type = nugget.get("content_type")
+async def process_one_chunk(nugget: Nugget, global_tags: list[str]) -> dict:
+    text = nugget.text
+    tags = nugget.tags or global_tags
 
     relevance = await check_relevance(text)
     if relevance.get("isAd"):
         return {"is_ad": True, "text": text}
+
+    # Start image generation early — runs concurrently with analysis pipeline
+    img_task: asyncio.Task | None = None
+    if not nugget.img_src:
+        img_task = asyncio.create_task(generate_image_for_chunk(text, tags))
 
     stats = get_chunk_stats(text)
     subject, evaluation, grammar = await asyncio.gather(
@@ -352,9 +403,7 @@ async def process_one_chunk(
         refined = await refine_chunk(text, grammar, evaluation if not isinstance(evaluation, Exception) else {})
         refined_text = refined.get("refinedText", text)
 
-    img_src = nugget.get("img_src") or None
-    if not img_src:
-        img_src = await generate_image_for_chunk(text, tags)
+    img_src = nugget.img_src or (await img_task if img_task else None)
 
     return {
         "is_ad": False,
@@ -365,7 +414,7 @@ async def process_one_chunk(
         "subject": subject.get("subject", "Untitled") if not isinstance(subject, Exception) else "Untitled",
         "stats": stats,
         "evaluation": evaluation if not isinstance(evaluation, Exception) else None,
-        "content_type": content_type,
+        "content_type": nugget.content_type,
     }
 
 # ── API Endpoints ──────────────────────────────────────────────────────────────
@@ -421,15 +470,15 @@ async def run_tool(req: ToolRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/process-chunks")
+@app.post("/api/process-chunks", response_model=ProcessChunksResponse)
 async def process_chunks(req: ProcessChunksRequest):
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-    async def bounded(nugget: dict, idx: int) -> dict:
+    async def bounded(nugget: Nugget) -> dict:
         async with semaphore:
-            return await process_one_chunk(nugget, idx, len(req.nuggets), req.image_index, req.tags)
+            return await process_one_chunk(nugget, req.tags)
 
-    tasks = [bounded(nugget, i) for i, nugget in enumerate(req.nuggets)]
+    tasks = [bounded(nugget) for nugget in req.nuggets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     valid_nuggets = []
